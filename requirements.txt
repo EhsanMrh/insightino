@@ -1,0 +1,8 @@
+pandas
+numpy
+pyarrow
+openpyxl
+PyYAML
+requests
+python-dotenv
+instagrapi
