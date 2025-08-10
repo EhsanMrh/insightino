@@ -1,8 +1,21 @@
+# Core data processing
 pandas
 numpy
 pyarrow
 openpyxl
 PyYAML
-requests
 python-dotenv
-instagrapi
+requests
+
+# Instagram API
+#instagrapi
+
+# RAG / Embeddings
+sentence-transformers
+hnswlib
+
+# Optional: if you want more multilingual embedding options
+flagembedding
+
+# For type hints and data classes
+dataclasses; python_version < '3.7'

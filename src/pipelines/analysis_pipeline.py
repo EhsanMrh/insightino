@@ -1,41 +1,78 @@
-import json, pandas as pd
-from enums.enum import Directories, OllamaModels
-from ..data.profile_builder import build_product_profile
-from ..memory.store import MemoryStore
+# src/pipelines/analysis_pipeline.py
 
-import os, glob, re
+from typing import Optional, Dict
 
-def _infer_period_from_sales() -> str:
-    files = sorted(glob.glob(os.path.join(Directories.RAW_SALES.value, "sales_data_*.xlsx")))
-    if not files:
-        return "latest"
-
-    # آخرین فایل بر اساس نام
-    last = os.path.basename(files[-1])  # e.g. sales_data_1404-05.xlsx یا sales_data_1404-05-01.xlsx
-    m = re.match(r"sales_data_(\d{4}-\d{2})(?:-\d{2})?\.xlsx$", last)
-    return m.group(1) if m else "latest"
+from src.brains.analyst_brain import AnalystBrain
+from src.memory.schemas import Filters
+from src.memory.retriever import Retriever, FusionConfig, RerankConfig
+from src.memory import context_builder
 
 
 class AnalysisPipeline:
-    def __init__(self, llm, logger):
+    """
+    Orchestrates the analysis stage of the system.
+    Uses AnalystBrain to retrieve evidence from RAG and synthesize answers via LLM.
+    """
+
+    def __init__(self, llm, embeddings, store, log):
+        """
+        :param llm: LLM provider (e.g., OllamaProvider)
+        :param embeddings: Embeddings provider
+        :param store: MemoryStore instance
+        :param log: Logger instance
+        """
+        self.log = log
+        self.embeddings = embeddings
+        self.store = store
         self.llm = llm
-        self.log = logger
-        self.mem = MemoryStore()
 
-    def run(self):
-        profile_df = build_product_profile()  # از Enum مسیرها را می‌خواند
-        self.log.info(f"Built product_profile ({len(profile_df)} rows)")
+        # Build retriever with injected components
+        self.retriever = Retriever(store=self.store, embeddings=self.embeddings, logger=self.log)
 
-        period = _infer_period_from_sales()
-        self.mem.save_snapshot(f"product_profile_{period}", profile_df.to_dict(orient="records"))
-        self.log.info(f"Snapshot saved for period {period}")
+        # Analyst brain
+        self.analyst_brain = AnalystBrain(retriever=self.retriever, llm=self.llm, logger=self.log)
 
-        for _, row in profile_df.iterrows():
-            product = row["product_key"]
-            prompt = f"""تحلیل کوتاه برای محصول: {product}
-داده‌ها: {json.dumps(row.to_dict(), ensure_ascii=False)}
-خروجی: 2-3 جمله خلاصه + 2 پیشنهاد عملی."""
-            text = self.llm.generate(prompt)
-            title = f"{product} — profile — {period}"   # idempotent per month
-            self.mem.add_or_replace_insight(title, text, tags=["product_profile","auto"])
-        self.log.info("Insights generated & stored.")
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run_query(
+        self,
+        query: str,
+        filters_by_namespace: Optional[Dict[str, Filters]] = None,
+        fusion_cfg: Optional[FusionConfig] = None,
+        rerank_cfg: Optional[RerankConfig] = None,
+        context_cfg: Optional[context_builder.ContextConfig] = None,
+    ) -> str:
+        """
+        Execute a single analysis query.
+        Returns an LLM-generated answer based on RAG evidence.
+        """
+        self.log.info(f"[AnalysisPipeline] Running analysis query: {query}")
+
+        answer = self.analyst_brain.analyze(
+            query=query,
+            filters_by_namespace=filters_by_namespace,
+            fusion_cfg=fusion_cfg,
+            rerank_cfg=rerank_cfg,
+            context_cfg=context_cfg,
+        )
+
+        self.log.info("[AnalysisPipeline] Query execution complete.")
+        return answer
+
+    def run_interactive(self) -> None:
+        """
+        Simple interactive loop for manual analysis queries.
+        """
+        self.log.info("[AnalysisPipeline] Starting interactive analysis mode. Type 'exit' to quit.")
+
+        while True:
+            query = input("\nEnter your analysis question: ").strip()
+            if not query or query.lower() in {"exit", "quit"}:
+                self.log.info("[AnalysisPipeline] Exiting interactive mode.")
+                break
+
+            answer = self.run_query(query)
+            print("\n=== ANSWER ===\n")
+            print(answer)
