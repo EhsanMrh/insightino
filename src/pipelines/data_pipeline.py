@@ -2,14 +2,17 @@
 
 import os
 import glob
+import json
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 import pandas as pd
+from llama_index.core import Document
 
-from enums.enum import Directories
-from src.brains.sales_brain import SalesBrain
-from src.brains.insta_brain import InstaBrain
+from enums.enum import Directories, RAGParams
+from src.utils.chunk_text import chunk_text
+from src.common.text_norm import normalize_fa
+from src.memory.store import MemoryStore
 
 
 class DataPipeline:
@@ -20,14 +23,11 @@ class DataPipeline:
       3) Indexing into the RAG store via SalesBrain / InstaBrain
     """
 
-    def __init__(self, log, embeddings, store):
+    def __init__(self, log, store: MemoryStore):
         self.log = log
-        self.embeddings = embeddings
         self.store = store
-
-        # Brains
-        self.sales_brain = SalesBrain(embeddings=self.embeddings, store=self.store, logger=self.log)
-        self.insta_brain = InstaBrain(embeddings=self.embeddings, store=self.store, logger=self.log)
+        self.index_log_path = Path(Directories.MEMORY_STORE.value) / "index_log.json"
+        self.index_log: Dict[str, str] = self._load_index_log()
 
     # ------------------------------------------------------------------
     # STAGING BUILDERS
@@ -221,22 +221,37 @@ class DataPipeline:
     # ------------------------------------------------------------------
 
     def index_all(self) -> None:
-        """
-        Index both sales and Instagram staging DataFrames into the RAG store.
-        """
-        # Sales
-        sales_df = self.stage_sales_merged()
-        if sales_df is not None and not sales_df.empty:
-            self.sales_brain.index_sales_data(sales_df)
-        else:
-            self.log.info("[DataPipeline] Skipping sales indexing (no staging data).")
+        # Discover files in raw dirs and index via ready-made loaders
+        sales_root = Path(Directories.RAW_SALES.value)
+        insta_root = Path(Directories.RAW_INSTAGRAM.value)
+        patterns = [
+            str(sales_root / "**/*.xlsx"),
+            str(sales_root / "**/*.csv"),
+            str(insta_root / "**/*.csv"),
+            str(insta_root / "**/*.pdf"),
+            str(insta_root / "**/*.md"),
+            str(insta_root / "**/*.txt"),
+        ]
+        files: List[str] = []
+        for p in patterns:
+            files.extend(glob.glob(p, recursive=True))
+        files = sorted(set(files))
+        self.log.info(f"[DataPipeline] Found {len(files)} files to consider for indexing.")
 
-        # Instagram
-        insta_df = self.stage_instagram_latest()
-        if insta_df is not None and not insta_df.empty:
-            self.insta_brain.index_insta_data(insta_df)
-        else:
-            self.log.info("[DataPipeline] Skipping Instagram indexing (no staging data).")
+        for fpath in files:
+            if not self._needs_index(fpath):
+                continue
+            try:
+                docs = self._load_file_as_documents(fpath)
+                if not docs:
+                    continue
+                namespace = self._infer_namespace(fpath)
+                self.store.add(namespace=namespace, documents=docs)
+                self._mark_indexed(fpath)
+                self.log.info(f"[DataPipeline] Indexed {len(docs)} docs from {fpath} into ns={namespace}")
+            except Exception as e:
+                self.log.error(f"[DataPipeline] Failed to index {fpath}: {e}")
+        self._save_index_log()
 
     # ------------------------------------------------------------------
     # INTERNAL HELPERS
@@ -260,14 +275,49 @@ class DataPipeline:
         dfc = df.copy()
         dfc.columns = [str(c).strip().lower() for c in dfc.columns]
 
-        # Required base columns with fallbacks
-        col_date = "sale_date" if "sale_date" in dfc.columns else ("date" if "date" in dfc.columns else None)
-        col_product = "product_name" if "product_name" in dfc.columns else ("product_id" if "product_id" in dfc.columns else None)
-        col_qty = "quantity" if "quantity" in dfc.columns else ("sales_qty" if "sales_qty" in dfc.columns else None)
+        # Helper: robust numeric parsing for Persian/Arabic digits and separators
+        def _clean_numeric_series(series: pd.Series) -> pd.Series:
+            import re as _re
 
-        missing = [name for name, col in [("sale_date/date", col_date),
-                                        ("product_name/product_id", col_product),
-                                        ("quantity/sales_qty", col_qty)] if col is None]
+            # Map Eastern Arabic and Persian digits to Western
+            digit_map = str.maketrans(
+                "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+                "01234567890123456789",
+            )
+            s = series.astype(str).str.strip().str.translate(digit_map)
+            # Normalize decimal/thousand separators
+            s = s.str.replace("٬", "", regex=False)  # Arabic thousands
+            s = s.str.replace(",", "", regex=False)  # thousands
+            s = s.str.replace("٫", ".", regex=False)  # Arabic decimal
+            # Keep digits, dot, minus only
+            s = s.str.replace(r"[^0-9\.-]", "", regex=True)
+            out = pd.to_numeric(s, errors="coerce")
+            return out
+
+        # Column aliasing (English + common Persian headers)
+        def _first_match(cols: list[str]) -> Optional[str]:
+            for c in cols:
+                if c in dfc.columns:
+                    return c
+            return None
+
+        col_date = _first_match([
+            "sale_date", "date", "تاریخ", "تاریخ فروش", "order_date",
+        ])
+        col_product = _first_match([
+            "product_name", "product", "product_id", "نام محصول", "محصول",
+        ])
+        col_qty = _first_match([
+            "quantity", "qty", "sales_qty", "تعداد", "تعداد فروش", "مقدار",
+        ])
+
+        missing = [
+            name for name, col in [
+                ("sale_date/date", col_date),
+                ("product_name/product_id", col_product),
+                ("quantity/sales_qty", col_qty),
+            ] if col is None
+        ]
         if missing:
             raise ValueError(f"Missing required sales columns: {', '.join(missing)}")
 
@@ -275,21 +325,132 @@ class DataPipeline:
         # Date → ISO string YYYY-MM-DD
         out["date"] = pd.to_datetime(dfc[col_date], errors="coerce").dt.strftime("%Y-%m-%d")
 
-        # Product id (keep as text; you can later map names to IDs if needed)
+        # Product id (normalize to stabilize grouping)
         out["product_id"] = dfc[col_product].astype(str).fillna("")
+        try:
+            # normalize_fa ensures consistent Persian/Arabic characters and spacing
+            out["product_id"] = out["product_id"].map(normalize_fa)
+        except Exception:
+            pass
 
         # Sales quantity (integer, non-negative)
-        out["sales_qty"] = pd.to_numeric(dfc[col_qty], errors="coerce").fillna(0).astype(int)
+        qty_num = _clean_numeric_series(dfc[col_qty]).fillna(0)
+        out["sales_qty"] = qty_num.round().astype(int)
         out.loc[out["sales_qty"] < 0, "sales_qty"] = 0
 
-        # Optional columns (set to None/0 if not provided)
-        # price (per-unit), revenue (total), returns (units), discount_pct (0-100)
-        out["price"] = pd.NA
-        out["revenue"] = pd.NA
-        out["returns"] = 0
-        out["discount_pct"] = pd.NA
+        # Optional columns (best-effort): price (per-unit), revenue (total), returns, discount_pct
+        col_price = _first_match(["price", "unit_price", "قیمت", "قیمت واحد"])  # per-unit
+        col_revenue = _first_match(["revenue", "total", "amount", "total_price", "مبلغ", "قیمت کل"])  # total
+        col_returns = _first_match(["returns", "return_qty", "مرجوعی"])  # units returned
+        col_discount = _first_match(["discount_pct", "discount", "درصد تخفیف", "تخفیف"])  # percent
+
+        price_num = _clean_numeric_series(dfc[col_price]) if col_price else pd.Series([pd.NA] * len(dfc))
+        revenue_num = _clean_numeric_series(dfc[col_revenue]) if col_revenue else pd.Series([pd.NA] * len(dfc))
+        returns_num = _clean_numeric_series(dfc[col_returns]) if col_returns else pd.Series([0] * len(dfc))
+        discount_num = _clean_numeric_series(dfc[col_discount]) if col_discount else pd.Series([pd.NA] * len(dfc))
+
+        out["price"] = price_num
+        # If revenue missing but price present, compute revenue = price * sales_qty
+        if col_revenue:
+            out["revenue"] = revenue_num
+        else:
+            try:
+                out["revenue"] = (price_num.fillna(0) * out["sales_qty"]).where(price_num.notna(), pd.NA)
+            except Exception:
+                out["revenue"] = pd.NA
+        out["returns"] = returns_num.fillna(0).round().astype(int)
+        out["discount_pct"] = discount_num
 
         return out
+
+    # -------------------------------
+    # Index log to avoid re-indexing
+    # -------------------------------
+    def _load_index_log(self) -> Dict[str, str]:
+        try:
+            return json.loads(Path(self.index_log_path).read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_index_log(self) -> None:
+        self.index_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.index_log_path.write_text(json.dumps(self.index_log, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _file_md5(self, path: str) -> str:
+        import hashlib
+        m = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                m.update(chunk)
+        return m.hexdigest()
+
+    def _needs_index(self, path: str) -> bool:
+        md5 = self._file_md5(path)
+        if self.index_log.get(path) == md5:
+            return False
+        return True
+
+    def _mark_indexed(self, path: str) -> None:
+        self.index_log[path] = self._file_md5(path)
+
+    # -------------------------------
+    # Loaders → Documents
+    # -------------------------------
+    def _infer_namespace(self, path: str) -> str:
+        p = Path(path).as_posix().lower()
+        if "/sales/" in p:
+            return "sales"
+        if "/instagram/" in p:
+            return "insta"
+        return "general"
+
+    def _load_file_as_documents(self, path: str) -> List[Document]:
+        ext = Path(path).suffix.lower()
+        texts: List[str] = []
+
+        if ext in {".csv"}:
+            df = pd.read_csv(path)
+            texts = [normalize_fa(str(row)) for row in df.astype(str).to_dict(orient="records")]
+        elif ext in {".xlsx", ".xls"}:
+            df = pd.read_excel(path)
+            texts = [normalize_fa(str(row)) for row in df.astype(str).to_dict(orient="records")]
+        elif ext in {".pdf"}:
+            try:
+                import fitz  # PyMuPDF
+            except Exception:
+                raise RuntimeError("PyMuPDF (pymupdf) not installed")
+            doc = fitz.open(path)
+            for page in doc:
+                texts.append(page.get_text("text"))
+        elif ext in {".json"}:
+            import json as _json
+            data = _json.loads(Path(path).read_text(encoding="utf-8"))
+            texts = [normalize_fa(json.dumps(data, ensure_ascii=False))]
+        else:
+            # txt / md fallback
+            texts = [normalize_fa(Path(path).read_text(encoding="utf-8", errors="ignore"))]
+
+        # chunk via ready-made splitter
+        chunks: List[str] = []
+        for t in texts:
+            chunks.extend(chunk_text(t, max_chars=int(RAGParams.CHUNK_SIZE.value), overlap=int(RAGParams.CHUNK_OVERLAP.value)))
+
+        # Build LlamaIndex Documents with metadata (ensure strings for text)
+        namespace = self._infer_namespace(path)
+        docs: List[Document] = []
+        for c in chunks:
+            text = c if isinstance(c, str) else str(c)
+            docs.append(
+                Document(
+                    text=text,
+                    metadata={
+                        "source": str(Path(path).name),
+                        "path": str(Path(path).as_posix()),
+                        "namespace": namespace,
+                    },
+                )
+            )
+        return docs
 
 
 

@@ -15,8 +15,12 @@ def build_product_profile() -> pd.DataFrame:
     sales = read_parquet(sales_merged)
     pmap  = pd.read_excel(map_path)
 
-    sales = sales.rename(columns={"product_name":"product_name_orig"})
-    sales["product_key"] = sales["product_name_orig"].map(normalize_fa)
+    # Build a normalized key from product identifier/name present in staging
+    # Staging uses 'product_id' from DataPipeline; fall back to 'product_name'
+    key_col = "product_id" if "product_id" in sales.columns else ("product_name" if "product_name" in sales.columns else None)
+    if key_col is None:
+        raise KeyError("Sales staging must have 'product_id' or 'product_name' column")
+    sales["product_key"] = sales[key_col].astype(str).map(normalize_fa)
 
     pmap  = pmap.rename(columns={"product":"product_name_orig"})
     pmap["product_key"] = pmap["product_name_orig"].map(normalize_fa)
@@ -31,10 +35,18 @@ def build_product_profile() -> pd.DataFrame:
         media[c] = pd.to_numeric(media[c], errors="coerce")
     if "media_type" not in media.columns and "media_type_id" in media.columns:
         media["media_type"] = media["media_type_id"].astype(str)
+    # Harmonize instagram column naming from staging
+    if "reach" in media.columns and "reach_count" not in media.columns:
+        media["reach_count"] = media["reach"]
+    if "impressions" in media.columns and "impressions_count" not in media.columns:
+        media["impressions_count"] = media["impressions"]
     media = media.sort_values("media_id").drop_duplicates(subset=["media_id"], keep="last")
 
+    qty_col = "sales_qty" if "sales_qty" in sales.columns else ("quantity" if "quantity" in sales.columns else None)
+    if qty_col is None:
+        raise KeyError("Sales staging must have 'sales_qty' or 'quantity' column")
     sales_agg = (sales.groupby("product_key", as_index=False)
-                 .agg(total_sales=("quantity","sum"), sale_rows=("quantity","count")))
+                 .agg(total_sales=(qty_col,"sum"), sale_rows=(qty_col,"count")))
 
     pm = pmap.merge(media, on="media_id", how="left")
 

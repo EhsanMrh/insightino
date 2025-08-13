@@ -1,6 +1,6 @@
 # src/memory/embeddings.py
 #
-# Embeddings via local Ollama ONLY.
+# Embeddings via HuggingFace Sentence Transformers by default.
 # - Caches results by SHA-256 of text
 # - L2-normalizes vectors (recommended for cosine similarity)
 # - Batch helper loops over single-call endpoint
@@ -21,7 +21,7 @@ from typing import List, Optional, Dict, Any
 import numpy as np
 import requests
 
-from enums.enum import OllamaModels, RAGParams
+from enums.enum import RAGParams
 
 
 def _sha256(text: str) -> str:
@@ -36,21 +36,20 @@ def _l2_normalize(vecs: np.ndarray) -> np.ndarray:
 
 class Embeddings:
     """
-    Ollama-only embedding provider.
-    POST {OLLAMA_HOST}/api/embeddings
-      body: {"model": <model_name>, "prompt": <text>}
-      resp: {"embedding": [floats...]}
+    Minimal embedding provider wrapper. For migration we keep a requests-based
+    client signature but recommend using LlamaIndex HuggingFace embeddings at
+    the index/query level (see MemoryStore._ensure_embedder()).
     """
 
     def __init__(
         self,
         model_name: Optional[str] = None,
-        normalize: bool = RAGParams.EMBED_NORMALIZE.value,
+        normalize: bool = True,
         cache: Optional[Dict[str, List[float]]] = None,
         ollama_base_url: Optional[str] = None,
         timeout_seconds: int = 60,
     ) -> None:
-        self.model_name = (model_name or OllamaModels.EMBEDDING_MODEL.value).strip()
+        self.model_name = (model_name or "intfloat/multilingual-e5-base").strip()
         self.normalize = bool(normalize)
         self.cache = cache if cache is not None else {}
         self.ollama_base_url = (ollama_base_url or os.getenv("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")

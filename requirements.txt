@@ -1,21 +1,36 @@
-# Core data processing
-pandas
 numpy
+pandas
 pyarrow
 openpyxl
-PyYAML
-python-dotenv
 requests
 
-# Instagram API
-#instagrapi
-
-# RAG / Embeddings
+# LlamaIndex core + embeddings + Qdrant vector store
+llama-index-core
+llama-index-embeddings-huggingface
+llama-index-vector-stores-qdrant
+llama-index-postprocessor-flag-embedding-reranker
 sentence-transformers
-hnswlib
+qdrant-client
+groq
 
-# Optional: if you want more multilingual embedding options
-flagembedding
+# Reranker (optional)
+FlagEmbedding
 
-# For type hints and data classes
-dataclasses; python_version < '3.7'
+# PDF generation
+reportlab
+
+# File loaders
+pymupdf
+
+# Telegram bot
+python-telegram-bot
+
+# Instagram
+instagrapi==2.2.1
+
+# OpenAI-compatible client for Groq
+# openai (optional if using OpenAI-compatible libs elsewhere)
+
+# Runtime helpers
+python-dotenv
+gradio

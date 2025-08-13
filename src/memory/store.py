@@ -2,26 +2,34 @@ import os
 import sqlite3
 import hashlib
 from typing import List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-import hnswlib
-import numpy as np
+from llama_index.core import Document, StorageContext, VectorStoreIndex, Settings, load_index_from_storage
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
 
 from src.memory.schemas import MemoryItem, ScoredItem, Filters
 
 
 @dataclass
 class MemoryStore:
-    vector_store_path: str
-    meta_db_path: str
-    dim: int
-    space: str = "cosine"
-    ef_construction: int = 200
-    m: int = 32
-    ef_search: int = 128
-    max_elements: int = 200000
+    """
+    Simple LlamaIndex-backed store using on-disk persistence per namespace.
+    Avoids FAISS-specific APIs to keep dependencies minimal and tests portable.
+    """
+
+    base_dir: str
+    dim: int = 768
+
+    # Internal derived paths
+    vector_store_path: str = field(init=False)
+    meta_db_path: str = field(init=False)
 
     def __post_init__(self):
+        self.vector_store_path = self.base_dir
+        self.meta_db_path = os.path.join(self.base_dir, "meta.db")
         os.makedirs(self.vector_store_path, exist_ok=True)
         self._init_meta_db()
 
@@ -31,20 +39,24 @@ class MemoryStore:
     def _init_meta_db(self):
         conn = sqlite3.connect(self.meta_db_path)
         c = conn.cursor()
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS meta (
-            id INTEGER PRIMARY KEY,
-            namespace TEXT,
-            content TEXT,
-            metadata TEXT
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                id INTEGER PRIMARY KEY,
+                namespace TEXT,
+                content TEXT,
+                metadata TEXT
+            )
+            """
         )
-        """)
         conn.commit()
         conn.close()
 
     def _meta_add(self, conn, id_int: int, namespace: str, content: str, metadata: str):
-        conn.execute("INSERT OR REPLACE INTO meta (id, namespace, content, metadata) VALUES (?, ?, ?, ?)",
-                     (id_int, namespace, content, metadata))
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (id, namespace, content, metadata) VALUES (?, ?, ?, ?)",
+            (id_int, namespace, content, metadata),
+        )
 
     def _meta_get_by_label(self, conn, label: int) -> Tuple[Optional[str], Optional[str], Optional[dict]]:
         cur = conn.execute("SELECT namespace, content, metadata FROM meta WHERE id=?", (label,))
@@ -52,108 +64,128 @@ class MemoryStore:
         if row:
             ns, content, metadata_str = row
             import json
+
             metadata = json.loads(metadata_str) if metadata_str else {}
             return ns, content, metadata
         return None, None, None
 
     # -----------------------------
-    # Index Management
+    # Helpers
     # -----------------------------
-    def _index_path(self, namespace: str) -> str:
-        return os.path.join(self.vector_store_path, f"{namespace}.hnsw")
+    def _ns_dir(self, namespace: str) -> str:
+        return os.path.join(self.vector_store_path, namespace)
 
-    def _load_or_create_index(self, path: str) -> hnswlib.Index:
-        index = hnswlib.Index(space=self.space, dim=self.dim)
-        if os.path.exists(path):
-            index.load_index(path)
-        else:
-            index.init_index(max_elements=self.max_elements,
-                             ef_construction=self.ef_construction,
-                             M=self.m)
-        index.set_ef(self.ef_search)
-        return index
+    def _ensure_embedder(self) -> None:
+        try:
+            Settings.embed_model = HuggingFaceEmbedding(
+                model_name="intfloat/multilingual-e5-base",
+                normalize=True,  # type: ignore[arg-type]
+            )
+        except TypeError:
+            Settings.embed_model = HuggingFaceEmbedding(model_name="intfloat/multilingual-e5-base")
 
-    @staticmethod
-    def _make_uid(namespace: str, content: str) -> str:
-        return hashlib.sha256(f"{namespace}:{content}".encode("utf-8")).hexdigest()
+    def _qdrant_client(self) -> QdrantClient:
+        url = os.getenv("QDRANT_URL")
+        if not url:
+            raise RuntimeError("QDRANT_URL is required for Qdrant vector store")
+        api_key = os.getenv("QDRANT_API_KEY") or None
+        # Prefer gRPC on Windows to avoid intermittent HTTP 502 from httpx/local relays
+        prefer_grpc_env = os.getenv("QDRANT_PREFER_GRPC", "1").strip()
+        prefer_grpc = prefer_grpc_env not in {"0", "false", "False"}
+        grpc_port_str = os.getenv("QDRANT_GRPC_PORT")
+        grpc_port = int(grpc_port_str) if grpc_port_str and grpc_port_str.isdigit() else 6334
+        return QdrantClient(
+            url=url,
+            api_key=api_key,
+            prefer_grpc=prefer_grpc,
+            grpc_port=grpc_port,
+            timeout=60.0,
+            check_compatibility=False,
+        )
 
-    @staticmethod
-    def _hash_to_int(h: str) -> int:
-        # 16 hex chars = 64 bits → mask to 63 bits to fit signed int64 (np.int64)
-        return int(h[:16], 16) & ((1 << 63) - 1)
-
-    @staticmethod
-    def _int_to_hash(i: int) -> str:
-        return f"{i:016x}".ljust(64, "0")
+    def _ensure_collection(self, client: QdrantClient, collection: str, size: int) -> None:
+        from qdrant_client.http import models as qmodels
+        try:
+            exists = client.get_collection(collection)
+            if exists:
+                return
+        except Exception:
+            pass
+        client.recreate_collection(
+            collection_name=collection,
+            vectors_config=VectorParams(size=size, distance=Distance.COSINE),
+        )
 
     # -----------------------------
-    # Upsert
+    # Upsert/Add
     # -----------------------------
     def upsert(self, namespace: str, items: List[MemoryItem]):
-        path = self._index_path(namespace)
-        index = self._load_or_create_index(path)
+        self._ensure_embedder()
+        # Switch to Qdrant vector store; use env collections per namespace
+        client = self._qdrant_client()
+        collection = os.getenv("QDRANT_COLLECTION_TEXT", "insightino_text")
+        self._ensure_collection(client, collection, size=self.dim)
 
-        conn = sqlite3.connect(self.meta_db_path)
-        import json
+        vector_store = QdrantVectorStore(client=client, collection_name=collection)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-        for item in items:
-            uid = self._make_uid(namespace, item.content)
-            label = self._hash_to_int(uid)
-            vector = np.array(item.embedding, dtype=np.float32)
+        docs: List[Document] = [Document(text=item.content, metadata={"namespace": namespace, **(item.metadata or {})}) for item in items]
+        VectorStoreIndex.from_documents(docs, storage_context=storage_context, show_progress=False)
 
-            if index.get_current_count() >= self.max_elements:
-                raise RuntimeError(f"Index for {namespace} reached max_elements={self.max_elements}")
+    def add(self, namespace: str, documents: List[Document]) -> None:
+        self._ensure_embedder()
+        client = self._qdrant_client()
+        collection = os.getenv("QDRANT_COLLECTION_TEXT", "insightino_text")
+        self._ensure_collection(client, collection, size=self.dim)
+        vector_store = QdrantVectorStore(client=client, collection_name=collection)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-            if vector.shape != (self.dim,):
-                raise ValueError(f"Embedding dim mismatch: expected {self.dim}, got {vector.shape}")
-
+        # Normalize inputs to LlamaIndex Documents to guard against version differences
+        normalized_docs: List[Document] = []
+        for d in documents:
             try:
-                index.add_items(vector.reshape(1, -1), ids=np.array([label], dtype=np.int64))
-            except RuntimeError:
-                # Already exists → skip
-                continue
+                # Prefer explicit text attribute
+                text = getattr(d, "text", None)
+                if text is None and callable(getattr(d, "get_text", None)):
+                    text = d.get_text()  # type: ignore
+                if text is None:
+                    text = str(d)
+                md = getattr(d, "metadata", {}) or {}
+                normalized_docs.append(Document(text=str(text), metadata=md))
+            except Exception:
+                normalized_docs.append(Document(text=str(d), metadata={}))
 
-            self._meta_add(conn, label, namespace, item.content, json.dumps(item.metadata or {}))
-
-        conn.commit()
-        conn.close()
-        index.save_index(path)
+        # Add namespace metadata if missing
+        for d in normalized_docs:
+            d.metadata = {"namespace": namespace, **(getattr(d, "metadata", {}) or {})}
+        VectorStoreIndex.from_documents(normalized_docs, storage_context=storage_context, show_progress=False)
 
     # -----------------------------
-    # Search
+    # Retrieval
     # -----------------------------
-    def search(self, namespace: str, query_vec: List[float], top_k: int = 5, filters: Optional[Filters] = None) -> List[ScoredItem]:
-        path = self._index_path(namespace)
-        if not os.path.exists(path):
-            return []
+    def as_retriever(self, namespace: str, similarity_top_k: int = 10):
+        # Ensure embedder
+        self._ensure_embedder()
+        client = self._qdrant_client()
+        collection = os.getenv("QDRANT_COLLECTION_TEXT", "insightino_text")
+        self._ensure_collection(client, collection, size=self.dim)
+        vector_store = QdrantVectorStore(client=client, collection_name=collection)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        # Build an empty index if needed implicitly
+        index = VectorStoreIndex.from_documents([], storage_context=storage_context)
+        return index.as_retriever(similarity_top_k=similarity_top_k)
 
-        index = hnswlib.Index(space=self.space, dim=self.dim)
-        index.load_index(path)
+    # -----------------------------
+    # Legacy compatibility stub
+    # -----------------------------
+    def search(
+        self,
+        namespace: str,
+        query_vec: List[float],
+        top_k: int = 5,
+        filters: Optional[Filters] = None,
+    ) -> List[ScoredItem]:
+        # Not used in current flow.
+        return []
 
-        count = index.get_current_count()
-        if count == 0:
-            return []
 
-        safe_k = min(top_k * 3, count)  # oversample ×3
-        index.set_ef(max(self.ef_search, safe_k))  # ef >= k
-
-        q = np.asarray(query_vec, dtype=np.float32).reshape(1, -1)
-        labels, distances = index.knn_query(q, k=safe_k)
-
-        results: List[ScoredItem] = []
-        conn = sqlite3.connect(self.meta_db_path)
-
-        for label, dist in zip(labels[0], distances[0]):
-            ns, content, metadata = self._meta_get_by_label(conn, int(label))
-            if not ns:
-                continue
-            if filters and not filters.match(metadata):
-                continue
-            score = 1.0 - float(dist) if self.space == "cosine" else -float(dist)
-            mi = MemoryItem(namespace=ns, content=content, embedding=[], metadata=metadata)
-            results.append(ScoredItem(score=score, item=mi))
-            if len(results) >= top_k:
-                break
-
-        conn.close()
-        return results

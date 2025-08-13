@@ -16,7 +16,7 @@ class AnalystBrain:
     def __init__(self, retriever: Retriever, llm, logger=None):
         """
         :param retriever: Retriever instance (wraps store + embeddings)
-        :param llm: LLM provider (e.g., OllamaProvider)
+        :param llm: LLM provider (e.g., GroqProvider)
         :param logger: Optional logger
         """
         self.retriever = retriever

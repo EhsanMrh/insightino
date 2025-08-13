@@ -1,51 +1,62 @@
 from enum import Enum
 
 
+# --------------------------------------------------------------------------------------
+# New enums per RAG refactor (keep names stable; do not rely on .env)
+# --------------------------------------------------------------------------------------
+
 class Directories(Enum):
-    # Root
-    ROOT = "data"
-
-    # Raw data sources
-    RAW_INSTAGRAM = "data/raw/instagram"                  # YYYYMMDD/instagram_posts.csv
-    RAW_SALES = "data/raw/sales"                          # sales_data_YYYY-MM-DD.xlsx
-    RAW_PRODUCT_MAP = "data/raw/product_media_map.xlsx"
-
-    # Staging (processed/intermediate)
+    RAW_BASE = "data/raw"
+    RAW_SALES = "data/raw/sales"
+    RAW_INSTAGRAM = "data/raw/instagram"
+    MEMORY_STORE = "data/memory_store"
+    LOGS = "data/logs"
+    REPORTS = "data/marts"  # PDF outputs live here
+    SESSIONS = "data/sessions"
+    STAGING = "data/staging"
+    # Staging file paths used by DataPipeline
     STAGING_INSTAGRAM = "data/staging/instagram_latest.parquet"
     STAGING_SALES = "data/staging/sales_merged.parquet"
 
-    # Data marts / aggregated outputs
-    MART_PRODUCT_PROFILE = "data/marts/product_profile.parquet"
 
-    # Logs / sessions
-    LOGS = "data/logs"
-    SESSIONS = "data/sessions"
-
-    # Memory / Vector store (RAG)
-    MEMORY_DB = "data/memory.sqlite"
-    VECTOR_STORE = "data/memory_store"
-
-    # Media download targets
-    DOWNLOAD_MEDIA = "data/raw/instagram/downloads"       # generic root for media
-    DOWNLOAD_PHOTOS = "data/raw/instagram/downloads/photos"
-    DOWNLOAD_VIDEOS = "data/raw/instagram/downloads/videos"
-    DOWNLOAD_CAROUSEL = "data/raw/instagram/downloads/carousel"
-
-
-class OllamaModels(Enum):
-    TEXT_GENERATION_MODEL = "qwen2.5"          # Default LLM for analysis
-    EMBEDDING_MODEL = "bge-m3"           # Embedding model (Ollama or sentence-transformers)
-    EMBED_NORMALIZE = True
-
-
-class Const(Enum):
-    INSTAGRAM_POST_COUNT = 5  # For optional fetch limits
+class Models(Enum):
+    GEN_MODEL = "llama-3.1-8b-instant"
+    EMBED_MODEL = "intfloat/multilingual-e5-base"
+    RERANK_MODEL = "BAAI/bge-reranker-base"
 
 
 class RAGParams(Enum):
-    # Embedding & vector search parameters
-    VECTOR_DIM = 1024           # must match embedding model output dimension
-    VECTOR_SPACE = "cosine"    # 'cosine', 'l2', or 'ip'
-    VECTOR_EF = 128            # HNSW search ef parameter
-    VECTOR_M = 16              # HNSW construction parameter
-    EMBED_NORMALIZE = True
+    CHUNK_SIZE = 800
+    CHUNK_OVERLAP = 100
+    TOP_K = 10
+    TOP_R = 5
+    MAX_CONTEXT_CHARS = 6000
+    NUM_CTX = 8192
+    TEMPERATURE = 0.2
+    TOP_P = 0.9
+
+
+class Flags(Enum):
+    USE_RERANKER = True
+
+
+class Bot(Enum):
+    # Token must come from env
+    BOT_TOKEN_KEY = ""
+
+
+# --------------------------------------------------------------------------------------
+# Legacy enums kept for backward compatibility with existing modules (unused after refactor)
+# --------------------------------------------------------------------------------------
+
+class Providers(Enum):
+    VECTOR_STORE = "qdrant"
+    LLM_PROVIDER = "groq"
+
+class QdrantDefaults(Enum):
+    COLLECTION_TEXT = "insightino_text"
+    COLLECTION_IMAGE = "insightino_image"
+
+
+class Const(Enum):
+    INSTAGRAM_POST_COUNT = 5

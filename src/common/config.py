@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from enums.enum import Directories, OllamaModels
+from enums.enum import Directories
 
 
 @dataclass
@@ -30,10 +30,11 @@ class Config:
     staging_sales: Path = Path(Directories.STAGING_SALES.value)
     mart_product_profile: Path = Path(Directories.MART_PRODUCT_PROFILE.value)
 
-    # LLM settings
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = OllamaModels.TEXT_GENERATION_MODEL.value
-    ollama_embed_model: str = OllamaModels.EMBEDDING_MODEL.value
+    # Vector/LLM provider settings (migrated to Qdrant + Groq)
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_collection_text: str = "insightino_text"
+    qdrant_collection_image: str = "insightino_image"
+    llm_provider: str = "groq"
 
     # RAG config (use default_factory to avoid mutable default)
     rag: RAGConfig = field(default_factory=RAGConfig)

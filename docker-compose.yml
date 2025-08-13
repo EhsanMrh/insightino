@@ -1,0 +1,25 @@
+services:
+  ui:
+    image: insightino-ui:latest
+    build:
+      context: .
+    container_name: insightino-ui
+    ports:
+      - "7860:7860"
+    volumes:
+      - 'C:\\Users\\Ehsan\\Desktop\\data_test_docker:/app/data'
+      - 'C:\\Users\\Ehsan\\Desktop\\data_test_docker\\qdrant:/qdrant/storage'
+      - 'C:\\Users\\Ehsan\\.cache\\huggingface:/root/.cache/huggingface'
+    env_file:
+      - .env
+    # Ensure HTTP is used (port 6333) per your environment
+    environment:
+      QDRANT_PREFER_GRPC: "0"
+      HF_HOME: "/root/.cache/huggingface"
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    
+
+

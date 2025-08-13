@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Iterable, Set
 
-from .schemas import ScoredItem
+try:
+    from llama_index.core.schema import NodeWithScore
+except Exception:  # pragma: no cover
+    NodeWithScore = None  # type: ignore
 
 
 @dataclass
@@ -29,7 +32,7 @@ class ContextConfig:
 
 def build(
     query: str,
-    items: List[ScoredItem],
+    items: List,  # List[NodeWithScore] in runtime
     cfg: Optional[ContextConfig] = None,
 ) -> str:
     """
@@ -44,7 +47,7 @@ def build(
     cfg = cfg or ContextConfig()
 
     # 1) Group by namespace (e.g., "sales", "insta", ...)
-    groups: Dict[str, List[ScoredItem]] = _group_by_namespace(items)
+    groups: Dict[str, List] = _group_by_namespace(items)
 
     # 2) Dedupe + cap per namespace
     for ns, lst in groups.items():
@@ -86,7 +89,7 @@ def _pick_heading(ns: str, cfg: ContextConfig) -> str:
 def _render_namespace_section(
     namespace: str,
     title: str,
-    items: List[ScoredItem],
+    items: List,  # List[NodeWithScore]
     cfg: ContextConfig,
 ) -> str:
     """
@@ -98,7 +101,9 @@ def _render_namespace_section(
 
     lines: List[str] = [f"## {title}"]
     for idx, si in enumerate(items, start=1):
-        content = (si.item.content or "").strip()
+        node = getattr(si, "node", None) or getattr(si, "item", None)
+        text = getattr(node, "text", None) or getattr(node, "get_text", lambda: "")()
+        content = (text or "").strip()
         meta_line = _format_metadata_inline(si, cfg.include_metadata_keys)
         cite = _format_citation(si, namespace, idx)
         # compact one-liner with short content preview
@@ -108,13 +113,14 @@ def _render_namespace_section(
     return "\n".join(lines)
 
 
-def _format_metadata_inline(si: ScoredItem, keys: Iterable[str]) -> str:
+def _format_metadata_inline(si, keys: Iterable[str]) -> str:
     """
     Format selected metadata keys inline in a stable order.
     Missing keys are skipped. Output example:
     [date=1404-05-12 | product_id=P123 | post_id=ABC]
     """
-    md = si.item.metadata or {}
+    node = getattr(si, "node", None) or getattr(si, "item", None)
+    md = getattr(node, "metadata", {}) or {}
     chunks: List[str] = []
     for k in keys:
         if k in md and md[k] not in (None, ""):
@@ -122,13 +128,14 @@ def _format_metadata_inline(si: ScoredItem, keys: Iterable[str]) -> str:
     return f"[{ ' | '.join(chunks) }]" if chunks else "[]"
 
 
-def _format_citation(si: ScoredItem, namespace: str, idx: int) -> str:
+def _format_citation(si, namespace: str, idx: int) -> str:
     """
     Produce a compact, stable citation token that an LLM can echo back.
     Encodes namespace and a few key metadata fields.
     Example: (ref:sales|date=1404-05-12|product=P123|post=XYZ)
     """
-    md = si.item.metadata or {}
+    node = getattr(si, "node", None) or getattr(si, "item", None)
+    md = getattr(node, "metadata", {}) or {}
     date = md.get("date", "")
     prod = md.get("product_id", "")
     post = md.get("post_id", "")
@@ -161,16 +168,18 @@ def _fit_budget(text: str, max_chars: int) -> str:
 # Grouping / Deduplication
 # ---------------------------------------------------------------------------
 
-def _group_by_namespace(items: List[ScoredItem]) -> Dict[str, List[ScoredItem]]:
+def _group_by_namespace(items: List) -> Dict[str, List]:
     """Group results by item.namespace."""
-    out: Dict[str, List[ScoredItem]] = {}
+    out: Dict[str, List] = {}
     for si in items:
-        ns = (si.item.namespace or "").strip().lower()
+        node = getattr(si, "node", None) or getattr(si, "item", None)
+        md = getattr(node, "metadata", {}) or {}
+        ns = str(md.get("namespace", "")).strip().lower()
         out.setdefault(ns, []).append(si)
     return out
 
 
-def _dedupe_items(items: List[ScoredItem], dedupe_on: Tuple[str, ...]) -> List[ScoredItem]:
+def _dedupe_items(items: List, dedupe_on: Tuple[str, ...]) -> List:
     """
     Deduplicate items using a compound key built from:
       - 'namespace' special case
@@ -179,17 +188,23 @@ def _dedupe_items(items: List[ScoredItem], dedupe_on: Tuple[str, ...]) -> List[S
     The first occurrence is kept (assuming items are pre-sorted by relevance).
     """
     seen: Set[str] = set()
-    output: List[ScoredItem] = []
+    output: List = []
 
     for si in items:
-        md = si.item.metadata or {}
+        node = getattr(si, "node", None) or getattr(si, "item", None)
+        md = getattr(node, "metadata", {}) or {}
         parts: List[str] = []
         for k in dedupe_on:
             if k == "namespace":
-                parts.append((si.item.namespace or "").lower())
+                ns = md.get("namespace")
+                if ns is None:
+                    # Try legacy attribute on item
+                    ns = getattr(getattr(si, "item", None), "namespace", "")
+                parts.append(str(ns).lower())
             else:
                 parts.append(str(md.get(k, "")))
-        parts.append((si.item.content or "")[:80])
+        text = getattr(node, "text", None) or getattr(node, "get_text", lambda: "")()
+        parts.append((text or "")[:80])
         key = "|".join(parts)
 
         if key in seen:
